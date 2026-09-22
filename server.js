@@ -1,51 +1,15 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const { execFileSync } = require('child_process');
 const { randomUUID } = require('crypto');
 const config = require('./project.config');
+const db = require('./lib/db');
+const { buildRouter: buildTourRouter } = require('./tour/routes');
 
 const app = express();
 const PORT = process.env.PORT || config.port;
-const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'app.db');
 
 app.use(express.json({ limit: '2mb' }));
 
-function sqlValue(value) {
-  if (value === null || value === undefined) return 'NULL';
-  return "'" + String(value).replaceAll("'", "''") + "'";
-}
-
-function runSql(sql) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  return execFileSync('sqlite3', [DB_FILE], {
-    input: sql,
-    encoding: 'utf8'
-  });
-}
-
-function select(sql) {
-  const output = runSql('.mode json\n' + sql);
-  if (!output.trim()) return [];
-  return JSON.parse(output);
-}
-
-function now() {
-  return new Date().toISOString();
-}
-
-function toRecord(row) {
-  const data = JSON.parse(row.data || '{}');
-  return {
-    id: row.id,
-    collection: row.collection,
-    status: row.status,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    ...data
-  };
-}
+const { sqlValue, runSql, select, now, toRecord, ensureSchema } = db;
 
 function findCollection(name) {
   const collection = config.collections[name];
@@ -92,31 +56,7 @@ function insertEvent({ recordId, collection, action, status, actor, note, data }
 }
 
 function initDb() {
-  runSql(`
-CREATE TABLE IF NOT EXISTS records (
-  id TEXT PRIMARY KEY,
-  collection TEXT NOT NULL,
-  status TEXT NOT NULL,
-  title TEXT NOT NULL,
-  data TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_records_collection ON records(collection);
-CREATE INDEX IF NOT EXISTS idx_records_status ON records(status);
-CREATE TABLE IF NOT EXISTS events (
-  id TEXT PRIMARY KEY,
-  record_id TEXT NOT NULL,
-  collection TEXT NOT NULL,
-  action TEXT NOT NULL,
-  status TEXT,
-  actor TEXT,
-  note TEXT,
-  data TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_record ON events(record_id);
-`);
+  ensureSchema();
 
   const count = select('SELECT COUNT(*) AS count FROM records;')[0].count;
   if (count > 0) return;
@@ -197,9 +137,24 @@ app.get('/api/meta', (req, res) => {
     title: config.title,
     description: config.description,
     collections: config.collections,
+    tour: config.tour,
     examples: config.examples || []
   });
 });
+
+// 巡演装箱业务路由（配重分层 + 返场解封台），须在通用 CRUD 之前挂载
+app.use('/api', buildTourRouter(config));
+
+// tourBoxes 是强约束业务集合，禁止通用改写，必须走业务接口
+const BUSINESS_COLLECTIONS = ['tourBoxes'];
+function guardBusinessCollection(req, res, next) {
+  if (BUSINESS_COLLECTIONS.includes(req.params.collection)) {
+    return res.status(405).json({
+      error: 'tourBoxes 仅支持业务接口：/api/tourBoxes/pack、/:id/seal、/:id/arrival、/:id/return-check、/:id/reset-position、/:id/release、/:id/corrections'
+    });
+  }
+  next();
+}
 
 app.get('/api/:collection', (req, res, next) => {
   try {
@@ -215,7 +170,7 @@ app.get('/api/:collection', (req, res, next) => {
   }
 });
 
-app.post('/api/:collection', (req, res, next) => {
+app.post('/api/:collection', guardBusinessCollection, (req, res, next) => {
   try {
     const collectionConfig = findCollection(req.params.collection);
     const data = { ...collectionConfig.defaults, ...req.body };
@@ -263,7 +218,7 @@ app.get('/api/:collection/:id', (req, res, next) => {
   }
 });
 
-app.patch('/api/:collection/:id', (req, res, next) => {
+app.patch('/api/:collection/:id', guardBusinessCollection, (req, res, next) => {
   try {
     findCollection(req.params.collection);
     const record = loadRecord(req.params.collection, req.params.id);
@@ -291,7 +246,7 @@ app.patch('/api/:collection/:id', (req, res, next) => {
   }
 });
 
-app.post('/api/:collection/:id/events', (req, res, next) => {
+app.post('/api/:collection/:id/events', guardBusinessCollection, (req, res, next) => {
   try {
     const collectionConfig = findCollection(req.params.collection);
     const record = loadRecord(req.params.collection, req.params.id);
@@ -343,7 +298,7 @@ app.get('/api/:collection/:id/timeline', (req, res, next) => {
   }
 });
 
-app.delete('/api/:collection/:id', (req, res, next) => {
+app.delete('/api/:collection/:id', guardBusinessCollection, (req, res, next) => {
   try {
     findCollection(req.params.collection);
     runSql('DELETE FROM records WHERE collection = ' + sqlValue(req.params.collection) + ' AND id = ' + sqlValue(req.params.id) + ';');
@@ -355,7 +310,7 @@ app.delete('/api/:collection/:id', (req, res, next) => {
 });
 
 app.use((error, req, res, next) => {
-  res.status(error.status || 500).json({ error: error.message || 'server error' });
+  res.status(error.status || 500).json({ error: error.message || 'server error', code: error.code });
 });
 
 app.listen(PORT, () => {
